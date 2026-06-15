@@ -262,8 +262,7 @@ impl<'a> Parser<'a> {
                 let name = child.name();
                 if let Some(iface_name) = name.strip_prefix("IID_") {
                     if is_guid_type(&child.ty()) {
-                        let tokens = self.tu.tokenize(self.tu.to_expansion_range(child.extent()));
-                        if let Some(uuid) = parse_guid_initializer(&tokens) {
+                        if let Some(uuid) = parse_guid_initializer(&child) {
                             self.iid_vars.insert(iface_name.to_string(), uuid);
                         }
                     }
@@ -762,81 +761,108 @@ fn is_guid_type(ty: &Type) -> bool {
     matches!(name.as_str(), "GUID" | "_GUID" | "IID")
 }
 
-/// Parse a GUID struct initializer from a token stream.
+/// Parse a GUID struct initializer from a cursor.
 ///
-/// Expects the token stream for a variable declaration like:
+/// Expects a typedef cursor whose type is `GUID`, containing an `InitListExpr`
+/// with the following child structure:
 /// ```c
 /// const GUID IID_IFoo = { 0x23170F69, 0x40C1, 0x278A, { 0, 0, 0, 3, 0, 1, 0, 0 } };
 /// ```
 ///
-/// Scans past the `=` token, then collects exactly 11 integer literals from
-/// the balanced `{ ... { ... } }` initializer: `data1` (u32), `data2` (u16),
-/// `data3` (u16), and `data4[0..8]` (8 × u8).
+/// Extracts `data1` (u32), `data2` (u16), `data3` (u16), and `data4[0..8]`
+/// (8 × u8) by evaluating each `IntegerLiteral` cursor directly via
+/// `clang_Cursor_Evaluate`, so macro-defined values are resolved correctly.
 ///
 /// Returns the UUID in standard `"xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"` format,
-/// or `None` if the token sequence does not match the expected shape.
-fn parse_guid_initializer(tokens: &[(CXTokenKind, String)]) -> Option<String> {
-    // Find the `=` that starts the initializer.
-    let eq_pos = tokens
+/// or `None` if the cursor does not match the expected shape, any value is out
+/// of range for its field, or evaluation fails.
+fn parse_guid_initializer(cursor: &Cursor) -> Option<String> {
+    //IID_IFoo GUID declaration will be of kind CXType_Typedef, have at least one of each children kind:
+    // CXCursor_TypeRef to "GUID"
+    //actual GUID value definition:
+    //      CXCursor_IntegerLiteral x3, then
+    //      CXCursor_InitListExpr with children with x8 of CXCursor_IntegerLiteral
+    if cursor.ty().kind() != CXType_Typedef && cursor.name() != "GUID" {
+        return None;
+    }
+
+    let guid_initialiser: Vec<_> = cursor
+        .children()
+        .into_iter()
+        .filter(|c| c.kind() == CXCursor_InitListExpr)
+        .collect();
+    if guid_initialiser.len() != 1 {
+        return None;
+    }
+
+    //grab the init list expr
+    let guid_initialiser = guid_initialiser[0].children();
+
+    //validate Cursor types of data1-3
+    if !guid_initialiser
         .iter()
-        .position(|(k, s)| *k == CXToken_Punctuation && s == "=")?;
-
-    // Collect all integer literals after the `=`.
-    let mut values = Vec::with_capacity(11);
-    for (kind, spelling) in &tokens[eq_pos + 1..] {
-        if *kind == CXToken_Literal {
-            let v = parse_c_int_literal(spelling)?;
-            values.push(v);
-        }
-    }
-
-    // Must have exactly 11 values: data1, data2, data3, data4[0..8].
-    if values.len() != 11 {
+        .take(3)
+        .all(|c| c.kind() == CXCursor_IntegerLiteral)
+    {
         return None;
     }
 
-    let data1 = values[0];
-    let data2 = values[1];
-    let data3 = values[2];
+    let mut data1_3 = [0u64; 3];
 
-    // Range-check: data1 ≤ u32, data2/data3 ≤ u16, data4 bytes ≤ u8.
-    if data1 > u32::MAX as u64 || data2 > u16::MAX as u64 || data3 > u16::MAX as u64 {
-        return None;
-    }
-    for &b in &values[3..11] {
-        if b > u8::MAX as u64 {
+    for i in 0..3 {
+        let data_eval: CXEvalResult = guid_initialiser[i].evaluate();
+        if unsafe { clang_EvalResult_getKind(data_eval) } != CXEval_Int {
             return None;
         }
+        data1_3[i] = unsafe { clang_EvalResult_getAsUnsigned(data_eval) };
     }
 
-    // Format as standard UUID: "data1-data2-data3-d4[0]d4[1]-d4[2]..d4[7]"
+    // Range-check: data1 ≤ u32, data2/data3 ≤ u16, data4 bytes ≤ u8.
+    if data1_3[0] > u32::MAX as u64 || data1_3[1] > u16::MAX as u64 || data1_3[2] > u16::MAX as u64
+    {
+        return None;
+    }
+
+    //validate data4 init list expr and its 8 children
+    let data4_cursor = &guid_initialiser[3];
+    if data4_cursor.kind() != CXCursor_InitListExpr {
+        return None;
+    }
+    if data4_cursor.children().len() != 8
+        || data4_cursor
+            .children()
+            .iter()
+            .all(|c| c.kind() != CXCursor_IntegerLiteral)
+    {
+        return None;
+    }
+
+    let mut data4 = [0u8; 8];
+
+    for (i, data4_i) in data4_cursor.children().iter().enumerate() {
+        let data4_eval = data4_i.evaluate();
+        if unsafe { clang_EvalResult_getKind(data4_eval) } != CXEval_Int {
+            return None;
+        }
+        let data4_i_val = unsafe { clang_EvalResult_getAsUnsigned(data4_eval) };
+        if data4_i_val > u8::MAX as u64 {
+            return None;
+        }
+        data4[i] = data4_i_val as u8;
+    }
+
     Some(format!(
         "{:08x}-{:04x}-{:04x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-        data1,
-        data2,
-        data3,
-        values[3],
-        values[4],
-        values[5],
-        values[6],
-        values[7],
-        values[8],
-        values[9],
-        values[10],
+        data1_3[0],
+        data1_3[1],
+        data1_3[2],
+        data4[0],
+        data4[1],
+        data4[2],
+        data4[3],
+        data4[4],
+        data4[5],
+        data4[6],
+        data4[7]
     ))
-}
-
-/// Parse a C integer literal into a `u64`, stripping any type suffix
-/// (`U`, `L`, `UL`, `LL`, `ULL`, etc.) and handling hex (`0x`) and decimal.
-fn parse_c_int_literal(lit: &str) -> Option<u64> {
-    // Strip trailing suffixes (L, U, LL, ULL, etc.).
-    let digits = lit.trim_end_matches(['u', 'U', 'l', 'L']);
-    if let Some(hex) = digits
-        .strip_prefix("0x")
-        .or_else(|| digits.strip_prefix("0X"))
-    {
-        u64::from_str_radix(hex, 16).ok()
-    } else {
-        digits.parse::<u64>().ok()
-    }
 }

@@ -465,6 +465,10 @@ impl Cursor {
         unsafe { clang_getCursorLanguage(self.0) }
     }
 
+    pub fn evaluate(&self) -> CXEvalResult {
+        unsafe { clang_Cursor_Evaluate(self.0) }
+    }
+
     /// Returns a stable string key `"filename:line:col"` that uniquely
     /// identifies this cursor's source location within a translation unit.
     ///
